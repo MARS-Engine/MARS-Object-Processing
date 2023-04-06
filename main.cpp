@@ -54,14 +54,15 @@ struct layer_component_param {
 struct engine_layer_component {
     void* target = nullptr;
     const object* parent;
-    std::function<void(const layer_component_param&)> callback;
 };
 
 struct engine_layers {
+    void (*m_callback)(const layer_component_param&);
     std::function<std::vector<engine_layer_component>(const object&)> m_validator;
 
-    explicit engine_layers(const std::function<std::vector<engine_layer_component>(const object&)>& _validor) {
+    explicit engine_layers(const std::function<std::vector<engine_layer_component>(const object&)>& _validor, void (*_callback)(const layer_component_param&)) {
         m_validator = _validor;
+        m_callback = _callback;
     }
 };
 
@@ -72,8 +73,8 @@ private:
     std::map<std::type_index, engine_layers> m_layer_data;
     std::map<std::type_index, std::shared_ptr<std::vector<engine_layer_component>>> m_layer_calls;
 public:
-    template<typename T> void add_layer(const std::function<std::vector<engine_layer_component>(const object&)>& _validator) {
-        m_layer_data.insert(std::make_pair(std::type_index(typeid(T)), engine_layers(_validator)));
+    template<typename T> void add_layer(const std::function<std::vector<engine_layer_component>(const object&)>& _validator, void (*_callback)(const layer_component_param&)) {
+        m_layer_data.insert(std::make_pair(std::type_index(typeid(T)), engine_layers(_validator, _callback)));
         m_layer_calls.insert(std::make_pair(std::type_index(typeid(T)), std::make_shared<std::vector<engine_layer_component>>()));
     }
 
@@ -104,19 +105,17 @@ public:
 
     template<typename T> void process_layer() {
         auto type = std::type_index(typeid(T));
+        void (*callback)(const layer_component_param&) = m_layer_data.at(type).m_callback;
+        auto components = m_layer_calls[type];
 
-        for (auto& calls : m_layer_calls) {
-            auto components = m_layer_calls[type];
-
-            layer_component_param param {
+        layer_component_param param {
                 .layers = components,
-            };
+        };
 
-            for (size_t i = 0; i < components->size(); i++) {
-                param.index = i;
-                param.component = &components->at(i);
-                components->at(i).callback(param);
-            }
+        for (size_t i = 0; i < components->size(); i++) {
+            param.index = i;
+            param.component = &components->at(i);
+            callback(param);
         }
     }
 };
@@ -128,7 +127,11 @@ public:
     virtual void update() { }
 };
 
-std::vector<engine_layer_component> update_layer_callback(const object& _target) {
+void update_layer_callback(const layer_component_param& _param) {
+    static_cast<update_layer*>(_param.component->target)->update();
+}
+
+std::vector<engine_layer_component> update_layer_validator(const object& _target) {
     std::vector<engine_layer_component> list;
 
     for (auto& comp : _target.components()) {
@@ -140,10 +143,6 @@ std::vector<engine_layer_component> update_layer_callback(const object& _target)
         auto new_component = engine_layer_component();
         new_component.target = target;
         new_component.parent = &_target;
-        new_component.callback = [](const layer_component_param& _param) {
-            static_cast<update_layer*>(_param.component->target)->update();
-        };
-
         list.push_back(new_component);
     }
 
@@ -176,9 +175,18 @@ public:
     }
 };
 
+class func_inc {
+private:
+    std::atomic<size_t> temp = 0;
+public:
+    void inc() {
+        temp++;
+    }
+};
+
 int main() {
     engine _engine;
-    _engine.add_layer<update_layer>(update_layer_callback);
+    _engine.add_layer<update_layer>(update_layer_validator, update_layer_callback);
 
     size_t l = 100'000;
 
@@ -189,18 +197,38 @@ int main() {
 
     _engine.spawn();
 
+    //calc base time;
+
     tick t;
+    std::atomic<size_t> temp = 0;
+    t.exec_tick();
+    for (size_t i = 0; i < l; i++)
+        temp++;
+    t.exec_tick();
+    std::printf("Base time - %f\n", t.delta_ms());
+
+
+    temp = 0;
+    func_inc fi;
+    t.exec_tick();
+    for (size_t i = 0; i < l; i++)
+        fi.inc();
+    t.exec_tick();
+    std::printf("Base Func time - %f\n", t.delta_ms());
+
     float second = 0;
     while (true) {
+        t.exec_tick();
         _engine.process_layer<update_layer>();
         t.exec_tick();
 
         if (index != l)
             throw "ERROR";
+
         index = 0;
         second += t.delta();
         if (second >= 1) {
-            std::printf("TEST - %f\n", t.delta_ms());
+            std::printf("Tick time - %f\n", t.delta_ms());
             second = 0;
         }
     }
