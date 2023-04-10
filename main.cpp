@@ -6,6 +6,7 @@
 #include <map>
 #include <typeindex>
 #include <chrono>
+#include <deque>
 
 /*
  *  This files shows a simple example of how MARS object Processing Works
@@ -13,11 +14,16 @@
  **/
 
 class object;
+class engine;
 
 class component : public std::enable_shared_from_this<component> {
 private:
     std::weak_ptr<object> m_object;
 public:
+    std::weak_ptr<object> get_object() const {
+        return m_object;
+    }
+
     explicit component(const std::weak_ptr<object>& _object) {
         m_object = _object;
     }
@@ -28,15 +34,17 @@ public:
 class object : public std::enable_shared_from_this<object> {
 private:
     std::vector<std::shared_ptr<component>> m_components;
+    std::weak_ptr<engine> m_engine;
 public:
+    explicit object(const std::weak_ptr<engine>& _weak) {
+        m_engine = _weak;
+    }
+
     const std::vector<std::shared_ptr<component>>& components() const {
         return m_components;
     }
 
-    template<typename T> std::weak_ptr<T> add_component(const std::shared_ptr<T>& _component) {
-        m_components.push_back(_component);
-        return _component;
-    }
+    template<typename T> std::weak_ptr<T> add_component(const std::shared_ptr<T>& _component);
 
     template<typename T> std::weak_ptr<T> add_component() {
         return add_component<T>(std::make_shared<T>(shared_from_this()));
@@ -53,54 +61,55 @@ struct layer_component_param {
 
 struct engine_layer_component {
     void* target = nullptr;
-    const object* parent;
+    std::weak_ptr<object> parent;
 };
 
 struct engine_layers {
     void (*m_callback)(const layer_component_param&);
-    std::function<std::vector<engine_layer_component>(const object&)> m_validator;
+    std::function<bool(const std::weak_ptr<component>&, engine_layer_component&)> m_validator;
 
-    explicit engine_layers(const std::function<std::vector<engine_layer_component>(const object&)>& _validor, void (*_callback)(const layer_component_param&)) {
+    explicit engine_layers(const std::function<bool(const std::weak_ptr<component>&, engine_layer_component&)>& _validor, void (*_callback)(const layer_component_param&)) {
         m_validator = _validor;
         m_callback = _callback;
     }
 };
 
-class engine {
+class engine : public std::enable_shared_from_this<engine> {
 private:
-    std::vector<std::shared_ptr<object>> m_objects;
-    std::vector<std::shared_ptr<object>> m_wait_objects;
+    std::deque<std::shared_ptr<object>> m_objects;
     std::map<std::type_index, engine_layers> m_layer_data;
+
+    std::map<std::type_index, std::shared_ptr<std::vector<engine_layer_component>>> m_wait_list;
     std::map<std::type_index, std::shared_ptr<std::vector<engine_layer_component>>> m_layer_calls;
 public:
-    template<typename T> void add_layer(const std::function<std::vector<engine_layer_component>(const object&)>& _validator, void (*_callback)(const layer_component_param&)) {
+    template<typename T> void add_layer(const std::function<bool(const std::weak_ptr<component>&, engine_layer_component&)>& _validator, void (*_callback)(const layer_component_param&)) {
         m_layer_data.insert(std::make_pair(std::type_index(typeid(T)), engine_layers(_validator, _callback)));
         m_layer_calls.insert(std::make_pair(std::type_index(typeid(T)), std::make_shared<std::vector<engine_layer_component>>()));
+        m_wait_list.insert(std::make_pair(std::type_index(typeid(T)), std::make_shared<std::vector<engine_layer_component>>()));
     }
 
-    std::shared_ptr<object> create_obj() {
-        auto obj = std::make_shared<object>();
-        m_wait_objects.push_back(obj);
+    std::weak_ptr<object> create_obj() {
+        auto obj = std::make_shared<object>(shared_from_this());
+        m_objects.push_back(obj);
         return obj;
     }
 
     void spawn() {
-        m_objects.resize(m_objects.size() + m_wait_objects.size());
+        for (auto& layer : m_layer_data) {
+            if (m_wait_list.at(layer.first)->empty())
+                continue;
 
-        for(auto& object : m_wait_objects) {
-            m_objects.push_back(object);
-
-            for (auto& layer : m_layer_data) {
-                std::vector<engine_layer_component> list = layer.second.m_validator(*object);
-
-                if (list.empty())
-                    continue;
-
-                m_layer_calls[layer.first]->insert(m_layer_calls[layer.first]->end(), list.begin(), list.end());
-            }
+            m_layer_calls.at(layer.first)->insert(m_layer_calls.at(layer.first)->end(), m_wait_list.at(layer.first)->begin(), m_wait_list.at(layer.first)->end());
+            m_wait_list.at(layer.first)->clear();
         }
+    }
 
-        m_wait_objects.clear();
+    void process_component(const std::weak_ptr<component>& _component) {
+        for (auto& layer : m_layer_data) {
+            engine_layer_component val;
+            if (m_layer_data.at(layer.first).m_validator(_component, val))
+                m_wait_list.at(layer.first)->push_back(val);
+        }
     }
 
     template<typename T> void process_layer() {
@@ -118,9 +127,32 @@ public:
             callback(param);
         }
     }
+
+    void destroy(const std::weak_ptr<object>& _obj) {
+        for (auto& layer : m_layer_data) {
+            m_layer_calls.at(layer.first)->erase(std::remove_if(m_layer_calls.at(layer.first)->begin(), m_layer_calls.at(layer.first)->end(), [&](const engine_layer_component& val) {
+                return val.parent.lock() == _obj.lock();
+            }), m_layer_calls.at(layer.first)->end());
+            m_wait_list.at(layer.first)->erase(std::remove_if(m_wait_list.at(layer.first)->begin(), m_wait_list.at(layer.first)->end(), [&](const engine_layer_component& val) {
+                return val.parent.lock() == _obj.lock();
+            }), m_wait_list.at(layer.first)->end());
+        }
+
+        m_objects.erase(std::find(m_objects.begin(), m_objects.end(), _obj.lock()));
+    }
 };
 
-std::atomic<size_t> index = 0;
+template<typename T> std::weak_ptr<T> object::add_component(const std::shared_ptr<T> &_component) {
+    m_components.push_back(_component);
+
+    auto ref = std::weak_ptr<T>(_component);
+
+    m_engine.lock().get()->process_component(ref);
+
+    return ref;
+}
+
+std::atomic<size_t> global_index = 0;
 
 class update_layer {
 public:
@@ -131,22 +163,17 @@ void update_layer_callback(const layer_component_param& _param) {
     static_cast<update_layer*>(_param.component->target)->update();
 }
 
-std::vector<engine_layer_component> update_layer_validator(const object& _target) {
-    std::vector<engine_layer_component> list;
+bool update_layer_validator(const std::weak_ptr<component>& _target, engine_layer_component& _val) {
 
-    for (auto& comp : _target.components()) {
-        auto target = dynamic_cast<update_layer*>(comp.get());
+    auto target = dynamic_cast<update_layer*>(_target.lock().get());
 
-        if (target == nullptr)
-            continue;
+    if (target == nullptr)
+        return false;
 
-        auto new_component = engine_layer_component();
-        new_component.target = target;
-        new_component.parent = &_target;
-        list.push_back(new_component);
-    }
+    _val.target = target;
+    _val.parent = _target.lock()->get_object();
 
-    return list;
+    return true;
 }
 
 class test_update : public component, public update_layer {
@@ -154,7 +181,7 @@ public:
     using component::component;
 
     void update() override {
-        index++;
+        global_index++;
     }
 };
 
@@ -179,23 +206,23 @@ class func_inc {
 private:
     std::atomic<size_t> temp = 0;
 public:
-    void inc() {
+    void inc() volatile  {
         temp++;
     }
 };
 
 int main() {
-    engine _engine;
-    _engine.add_layer<update_layer>(update_layer_validator, update_layer_callback);
+    auto _engine = std::make_shared<engine>();
+    _engine->add_layer<update_layer>(update_layer_validator, update_layer_callback);
 
     size_t l = 100'000;
 
     for (size_t i = 0; i < l; i++) {
-        auto obj = _engine.create_obj();
-        obj->add_component<test_update>();
+        auto obj = _engine->create_obj();
+        obj.lock()->add_component<test_update>();
     }
 
-    _engine.spawn();
+    _engine->spawn();
 
     //calc base time;
 
@@ -207,29 +234,63 @@ int main() {
     t.exec_tick();
     std::printf("Base time - %f\n", t.delta_ms());
 
-
-    temp = 0;
     func_inc fi;
+
     t.exec_tick();
     for (size_t i = 0; i < l; i++)
         fi.inc();
     t.exec_tick();
+
     std::printf("Base Func time - %f\n", t.delta_ms());
 
     float second = 0;
-    while (true) {
+
+    float time_since_start = 0.0f;
+
+    while (time_since_start < 5) {
         t.exec_tick();
-        _engine.process_layer<update_layer>();
+        _engine->process_layer<update_layer>();
+        _engine->spawn();
         t.exec_tick();
 
-        if (index != l)
+        if (global_index != l)
             throw "ERROR";
 
-        index = 0;
+        global_index = 0;
         second += t.delta();
         if (second >= 1) {
             std::printf("Tick time - %f\n", t.delta_ms());
             second = 0;
         }
+
+        time_since_start += t.delta();
+    }
+
+    time_since_start = 0.0f;
+
+    auto obj = _engine->create_obj();
+    obj.lock()->add_component<test_update>();
+    _engine->spawn();
+
+    while (time_since_start < 5) {
+        t.exec_tick();
+        _engine->process_layer<update_layer>();
+        _engine->destroy(obj);
+        obj = _engine->create_obj();
+        obj.lock()->add_component<test_update>();
+        _engine->spawn();
+        t.exec_tick();
+
+        if (global_index != l + 1)
+            throw "ERROR";
+
+        global_index = 0;
+        second += t.delta();
+        if (second >= 1) {
+            std::printf("Reallocate Tick time - %f\n", t.delta_ms());
+            second = 0;
+        }
+
+        time_since_start += t.delta();
     }
 }
