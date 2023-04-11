@@ -7,6 +7,7 @@
 #include <typeindex>
 #include <chrono>
 #include <deque>
+#include <execution>
 
 /*
  *  This files shows a simple example of how MARS object Processing Works
@@ -54,14 +55,43 @@ public:
 struct engine_layer_component;
 
 struct layer_component_param {
-    engine_layer_component* component;
+    engine* _engine;
     std::shared_ptr<std::vector<engine_layer_component>> layers;
-    size_t index;
 };
 
 struct engine_layer_component {
     void* target = nullptr;
-    std::weak_ptr<object> parent;
+    object* parent = nullptr;
+
+    engine_layer_component() = default;
+
+    engine_layer_component(const engine_layer_component& _copy) noexcept {
+        target = _copy.target;
+        parent = _copy.parent;
+    }
+
+    engine_layer_component(engine_layer_component&& _move) noexcept {
+        target = _move.target;
+        parent = _move.parent;
+    }
+
+    engine_layer_component& operator=(const engine_layer_component& _copy) noexcept {
+        if (this == &_copy)
+            return *this;
+
+        target = _copy.target;
+        parent = _copy.parent;
+        return *this;
+    }
+
+    engine_layer_component& operator=(engine_layer_component&& _move) noexcept {
+        if (this == &_move)
+            return *this;
+
+        target = _move.target;
+        parent = _move.parent;
+        return *this;
+    }
 };
 
 struct engine_layers {
@@ -76,12 +106,19 @@ struct engine_layers {
 
 class engine : public std::enable_shared_from_this<engine> {
 private:
+    std::deque<std::shared_ptr<object>> m_destroy_list;
     std::deque<std::shared_ptr<object>> m_objects;
     std::map<std::type_index, engine_layers> m_layer_data;
 
     std::map<std::type_index, std::shared_ptr<std::vector<engine_layer_component>>> m_wait_list;
     std::map<std::type_index, std::shared_ptr<std::vector<engine_layer_component>>> m_layer_calls;
 public:
+    /**
+     * Note: In practice this would be inside the workers class and shared between workers
+     * Note 2: This should be an atomic but because this would invalidate previous tests its going to continue being a layer_index, in practice it will be slightly slower but because its multitreaded the result will be way faster
+     */
+    size_t layer_index;
+
     template<typename T> void add_layer(const std::function<bool(const std::weak_ptr<component>&, engine_layer_component&)>& _validator, void (*_callback)(const layer_component_param&)) {
         m_layer_data.insert(std::make_pair(std::type_index(typeid(T)), engine_layers(_validator, _callback)));
         m_layer_calls.insert(std::make_pair(std::type_index(typeid(T)), std::make_shared<std::vector<engine_layer_component>>()));
@@ -94,11 +131,28 @@ public:
         return obj;
     }
 
-    void spawn() {
+    void destroy_and_spawn() {
+        for (auto& _obj : m_destroy_list) {
+            for (auto& layer : m_layer_data) {
+                m_layer_calls.at(layer.first)->erase(std::remove_if(m_layer_calls.at(layer.first)->begin(), m_layer_calls.at(layer.first)->end(), [&](const engine_layer_component& val) {
+                    return val.parent == _obj.get();
+                }), m_layer_calls.at(layer.first)->end());
+
+                m_wait_list.at(layer.first)->erase(std::remove_if(m_wait_list.at(layer.first)->begin(), m_wait_list.at(layer.first)->end(), [&](const engine_layer_component& val) {
+                    return val.parent == _obj.get();
+                }), m_wait_list.at(layer.first)->end());
+            }
+
+            m_objects.erase(std::find(m_objects.begin(), m_objects.end(), _obj));
+        }
+
+        m_destroy_list.clear();
+
         for (auto& layer : m_layer_data) {
             if (m_wait_list.at(layer.first)->empty())
                 continue;
 
+            m_layer_calls.at(layer.first)->reserve(m_layer_calls.at(layer.first)->size() + m_wait_list.at(layer.first)->size());
             m_layer_calls.at(layer.first)->insert(m_layer_calls.at(layer.first)->end(), m_wait_list.at(layer.first)->begin(), m_wait_list.at(layer.first)->end());
             m_wait_list.at(layer.first)->clear();
         }
@@ -113,32 +167,20 @@ public:
     }
 
     template<typename T> void process_layer() {
+        layer_index = 0;
         auto type = std::type_index(typeid(T));
-        void (*callback)(const layer_component_param&) = m_layer_data.at(type).m_callback;
-        auto components = m_layer_calls[type];
+        auto components = m_layer_calls.at(type);
 
         layer_component_param param {
-                .layers = components,
+                ._engine = this,
+                .layers = components
         };
 
-        for (size_t i = 0; i < components->size(); i++) {
-            param.index = i;
-            param.component = &components->at(i);
-            callback(param);
-        }
+        m_layer_data.at(type).m_callback(param);
     }
 
-    void destroy(const std::weak_ptr<object>& _obj) {
-        for (auto& layer : m_layer_data) {
-            m_layer_calls.at(layer.first)->erase(std::remove_if(m_layer_calls.at(layer.first)->begin(), m_layer_calls.at(layer.first)->end(), [&](const engine_layer_component& val) {
-                return val.parent.lock() == _obj.lock();
-            }), m_layer_calls.at(layer.first)->end());
-            m_wait_list.at(layer.first)->erase(std::remove_if(m_wait_list.at(layer.first)->begin(), m_wait_list.at(layer.first)->end(), [&](const engine_layer_component& val) {
-                return val.parent.lock() == _obj.lock();
-            }), m_wait_list.at(layer.first)->end());
-        }
-
-        m_objects.erase(std::find(m_objects.begin(), m_objects.end(), _obj.lock()));
+    void destroy(const std::shared_ptr<object>& _obj) {
+        m_destroy_list.push_back(_obj);
     }
 };
 
@@ -159,8 +201,12 @@ public:
     virtual void update() { }
 };
 
+/*
+ * Note when optimizing: This function is a single-thread example, in the actual MARS Engine this function will be executed by multiple threads and the for loop will use an atomic index
+ * */
 void update_layer_callback(const layer_component_param& _param) {
-    static_cast<update_layer*>(_param.component->target)->update();
+    for (size_t i = 0; i < _param.layers->size(); i++)
+        static_cast<update_layer*>(_param.layers->at(i).target)->update();
 }
 
 bool update_layer_validator(const std::weak_ptr<component>& _target, engine_layer_component& _val) {
@@ -171,7 +217,7 @@ bool update_layer_validator(const std::weak_ptr<component>& _target, engine_laye
         return false;
 
     _val.target = target;
-    _val.parent = _target.lock()->get_object();
+    _val.parent = _target.lock()->get_object().lock().get();
 
     return true;
 }
@@ -222,7 +268,7 @@ int main() {
         obj.lock()->add_component<test_update>();
     }
 
-    _engine->spawn();
+    _engine->destroy_and_spawn();
 
     //calc base time;
 
@@ -250,7 +296,7 @@ int main() {
     while (time_since_start < 5) {
         t.exec_tick();
         _engine->process_layer<update_layer>();
-        _engine->spawn();
+        _engine->destroy_and_spawn();
         t.exec_tick();
 
         if (global_index != l)
@@ -270,15 +316,15 @@ int main() {
 
     auto obj = _engine->create_obj();
     obj.lock()->add_component<test_update>();
-    _engine->spawn();
+    _engine->destroy_and_spawn();
 
     while (time_since_start < 5) {
         t.exec_tick();
         _engine->process_layer<update_layer>();
-        _engine->destroy(obj);
+        _engine->destroy(obj.lock());
         obj = _engine->create_obj();
         obj.lock()->add_component<test_update>();
-        _engine->spawn();
+        _engine->destroy_and_spawn();
         t.exec_tick();
 
         if (global_index != l + 1)
