@@ -119,8 +119,20 @@ public:
      */
     size_t layer_index;
 
-    template<typename T> void add_layer(const std::function<bool(const std::weak_ptr<component>&, engine_layer_component&)>& _validator, void (*_callback)(const layer_component_param&)) {
-        m_layer_data.insert(std::make_pair(std::type_index(typeid(T)), engine_layers(_validator, _callback)));
+    template<typename T> void add_layer(void (*_callback)(const layer_component_param&)) {
+        auto validator = [](const std::weak_ptr<component>& _target, engine_layer_component& _val) {
+            auto target = dynamic_cast<T*>(_target.lock().get());
+
+            if (target == nullptr)
+                return false;
+
+            _val.target = target;
+            _val.parent = _target.lock()->get_object().lock().get();
+
+            return true;
+        };
+
+        m_layer_data.insert(std::make_pair(std::type_index(typeid(T)), engine_layers(validator, _callback)));
         m_layer_calls.insert(std::make_pair(std::type_index(typeid(T)), std::make_shared<std::vector<engine_layer_component>>()));
         m_wait_list.insert(std::make_pair(std::type_index(typeid(T)), std::make_shared<std::vector<engine_layer_component>>()));
     }
@@ -209,19 +221,6 @@ void update_layer_callback(const layer_component_param& _param) {
         static_cast<update_layer*>(_param.layers->at(i).target)->update();
 }
 
-bool update_layer_validator(const std::weak_ptr<component>& _target, engine_layer_component& _val) {
-
-    auto target = dynamic_cast<update_layer*>(_target.lock().get());
-
-    if (target == nullptr)
-        return false;
-
-    _val.target = target;
-    _val.parent = _target.lock()->get_object().lock().get();
-
-    return true;
-}
-
 class test_update : public component, public update_layer {
 public:
     using component::component;
@@ -259,7 +258,7 @@ public:
 
 int main() {
     auto _engine = std::make_shared<engine>();
-    _engine->add_layer<update_layer>(update_layer_validator, update_layer_callback);
+    _engine->add_layer<update_layer>(update_layer_callback);
 
     size_t l = 100'000;
 
