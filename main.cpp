@@ -7,7 +7,6 @@
 #include <typeindex>
 #include <chrono>
 #include <deque>
-#include <execution>
 
 /*
  *  This files shows a simple example of how MARS object Processing Works
@@ -96,9 +95,9 @@ struct engine_layer_component {
 
 struct engine_layers {
     void (*m_callback)(const layer_component_param&);
-    std::function<bool(const std::weak_ptr<component>&, engine_layer_component&)> m_validator;
+    bool (*m_validator)(const std::weak_ptr<component>&, engine_layer_component&);
 
-    explicit engine_layers(const std::function<bool(const std::weak_ptr<component>&, engine_layer_component&)>& _validor, void (*_callback)(const layer_component_param&)) {
+    explicit engine_layers(bool (*_validor)(const std::weak_ptr<component>&, engine_layer_component&), void (*_callback)(const layer_component_param&)) {
         m_validator = _validor;
         m_callback = _callback;
     }
@@ -106,8 +105,8 @@ struct engine_layers {
 
 class engine : public std::enable_shared_from_this<engine> {
 private:
-    std::deque<std::shared_ptr<object>> m_destroy_list;
-    std::deque<std::shared_ptr<object>> m_objects;
+    std::vector<std::shared_ptr<object>> m_destroy_list;
+    std::vector<std::shared_ptr<object>> m_objects;
     std::map<std::type_index, engine_layers> m_layer_data;
 
     std::map<std::type_index, std::shared_ptr<std::vector<engine_layer_component>>> m_wait_list;
@@ -146,34 +145,41 @@ public:
     void destroy_and_spawn() {
         for (auto& _obj : m_destroy_list) {
             for (auto& layer : m_layer_data) {
-                m_layer_calls.at(layer.first)->erase(std::remove_if(m_layer_calls.at(layer.first)->begin(), m_layer_calls.at(layer.first)->end(), [&](const engine_layer_component& val) {
-                    return val.parent == _obj.get();
-                }), m_layer_calls.at(layer.first)->end());
+                std::vector<engine_layer_component>& call_layer = *m_layer_calls.at(layer.first);
+                std::vector<engine_layer_component>& wait_layer = *m_wait_list.at(layer.first);
 
-                m_wait_list.at(layer.first)->erase(std::remove_if(m_wait_list.at(layer.first)->begin(), m_wait_list.at(layer.first)->end(), [&](const engine_layer_component& val) {
+                call_layer.erase(std::remove_if(call_layer.begin(), call_layer.end(), [&](const engine_layer_component& val) {
                     return val.parent == _obj.get();
-                }), m_wait_list.at(layer.first)->end());
+                }), call_layer.end());
+
+                wait_layer.erase(std::remove_if(wait_layer.begin(), wait_layer.end(), [&](const engine_layer_component& val) {
+                    return val.parent == _obj.get();
+                }), wait_layer.end());
             }
 
             m_objects.erase(std::find(m_objects.begin(), m_objects.end(), _obj));
         }
 
-        m_destroy_list.clear();
+        if (!m_destroy_list.empty())
+            m_destroy_list.clear();
 
         for (auto& layer : m_layer_data) {
             if (m_wait_list.at(layer.first)->empty())
                 continue;
 
-            m_layer_calls.at(layer.first)->reserve(m_layer_calls.at(layer.first)->size() + m_wait_list.at(layer.first)->size());
-            m_layer_calls.at(layer.first)->insert(m_layer_calls.at(layer.first)->end(), m_wait_list.at(layer.first)->begin(), m_wait_list.at(layer.first)->end());
-            m_wait_list.at(layer.first)->clear();
+            std::vector<engine_layer_component>& call_layer = *m_layer_calls.at(layer.first);
+            std::vector<engine_layer_component>& wait_layer = *m_wait_list.at(layer.first);
+
+            call_layer.reserve(call_layer.size() + wait_layer.size());
+            call_layer.insert(call_layer.end(), wait_layer.begin(), wait_layer.end());
+            wait_layer.clear();
         }
     }
 
     void process_component(const std::weak_ptr<component>& _component) {
         for (auto& layer : m_layer_data) {
             engine_layer_component val;
-            if (m_layer_data.at(layer.first).m_validator(_component, val))
+            if (layer.second.m_validator(_component, val))
                 m_wait_list.at(layer.first)->push_back(val);
         }
     }
@@ -201,7 +207,7 @@ template<typename T> std::weak_ptr<T> object::add_component(const std::shared_pt
 
     auto ref = std::weak_ptr<T>(_component);
 
-    m_engine.lock().get()->process_component(ref);
+    m_engine.lock()->process_component(ref);
 
     return ref;
 }
@@ -217,8 +223,8 @@ public:
  * Note when optimizing: This function is a single-thread example, in the actual MARS Engine this function will be executed by multiple threads and the for loop will use an atomic index
  * */
 void update_layer_callback(const layer_component_param& _param) {
-    for (size_t i = 0; i < _param.layers->size(); i++)
-        static_cast<update_layer*>(_param.layers->at(i).target)->update();
+    for (auto& item : *_param.layers)
+        static_cast<update_layer*>(item.target)->update();
 }
 
 class test_update : public component, public update_layer {
